@@ -101,10 +101,14 @@ def find_video_sources():
 
 
 class KinectCapture:
-    def __init__(self, output_dir=".", audio_device=None, duration=None):
+    def __init__(self, output_dir=".", audio_device=None, duration=None, countdown=3):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.duration = duration
+        self.countdown = countdown
+
+        # Countdown state
+        self.countdown_end = None  # monotonic time when countdown finishes
 
         # Video sources
         self.video_sources = find_video_sources()
@@ -496,6 +500,32 @@ class KinectCapture:
                 except Empty:
                     break
 
+    def _begin_countdown(self):
+        """Start the countdown timer. Recording begins when it expires."""
+        if self.countdown <= 0:
+            self.start_recording()
+            return
+        self.countdown_end = time.monotonic() + self.countdown
+        print(f"Recording in {self.countdown}...")
+
+    def _draw_countdown(self, display):
+        """Draw countdown number centered on the video frame."""
+        if self.countdown_end is None:
+            return
+        remaining = self.countdown_end - time.monotonic()
+        if remaining <= 0:
+            return
+        num = str(int(remaining) + 1)
+        # Large centered text with dark outline
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 4.0
+        thickness = 8
+        (tw, th), _ = cv2.getTextSize(num, font, scale, thickness)
+        cx = (640 - tw) // 2
+        cy = (TOOLBAR_H + display.shape[0]) // 2 + th // 2
+        cv2.putText(display, num, (cx, cy), font, scale, (0, 0, 0), thickness + 4)
+        cv2.putText(display, num, (cx, cy), font, scale, (255, 255, 255), thickness)
+
     def start_recording(self):
         """Begin a new recording."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -646,12 +676,23 @@ class KinectCapture:
                     # Auto-start recording once first frame arrives
                     if auto_start_pending:
                         auto_start_pending = False
+                        self._begin_countdown()
+
+                    # Check if countdown finished
+                    if (
+                        self.countdown_end is not None
+                        and time.monotonic() >= self.countdown_end
+                    ):
+                        self.countdown_end = None
                         self.start_recording()
 
                     # Build display with toolbar above the video
                     toolbar = np.zeros((TOOLBAR_H, 640, 3), dtype=np.uint8)
                     display = np.vstack([toolbar, frame])
                     buttons = self._draw_toolbar(display)
+
+                    # Countdown overlay
+                    self._draw_countdown(display)
 
                     # Waveform overlay on bottom of video
                     self._draw_waveform(display)
@@ -663,8 +704,11 @@ class KinectCapture:
                 if action == "record":
                     if self.recording:
                         self.stop_recording()
+                    elif self.countdown_end is not None:
+                        self.countdown_end = None
+                        print("Countdown cancelled")
                     else:
-                        self.start_recording()
+                        self._begin_countdown()
                 elif action == "video":
                     self._switch_video_source()
                 elif action == "audio":
@@ -687,8 +731,11 @@ class KinectCapture:
                 elif key == ord("r") or key == ord("R"):
                     if self.recording:
                         self.stop_recording()
+                    elif self.countdown_end is not None:
+                        self.countdown_end = None
+                        print("Countdown cancelled")
                     else:
-                        self.start_recording()
+                        self._begin_countdown()
 
                 elif key == ord("v") or key == ord("V"):
                     self._switch_video_source()
@@ -727,6 +774,8 @@ class KinectCapture:
 def main():
     parser = argparse.ArgumentParser(description="Kinect RGB + Scarlett Audio Capture")
     parser.add_argument("--duration", type=float, help="Auto-stop after N seconds")
+    parser.add_argument("--countdown", type=int, default=3,
+                        help="Countdown seconds before recording (default: 3, 0 to disable)")
     parser.add_argument("--output", default=".", help="Output directory (default: .)")
     parser.add_argument("--audio-device", default=None,
                         help="sounddevice device name/index (default: auto-detect Scarlett)")
@@ -736,6 +785,7 @@ def main():
         output_dir=args.output,
         audio_device=args.audio_device,
         duration=args.duration,
+        countdown=args.countdown,
     )
     cap.run()
 
