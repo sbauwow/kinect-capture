@@ -101,11 +101,13 @@ def find_video_sources():
 
 
 class KinectCapture:
-    def __init__(self, output_dir=".", audio_device=None, duration=None, countdown=3):
+    def __init__(self, output_dir=".", audio_device=None, duration=None,
+                 countdown=3, mp4=False):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.duration = duration
         self.countdown = countdown
+        self.mp4_mode = mp4  # True=H.264 MP4, False=FFV1 MKV
 
         # Countdown state
         self.countdown_end = None  # monotonic time when countdown finishes
@@ -309,6 +311,17 @@ class KinectCapture:
         cv2.putText(display, audio_label, (x + 8, TOOLBAR_H - 13),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
         buttons.append(("audio", x, x + bw))
+        x += bw + 12
+
+        # Format toggle button (MKV / MP4)
+        fmt_label = "MP4" if self.mp4_mode else "MKV"
+        color = (0, 120, 120) if self.mp4_mode else (90, 90, 90)
+        bw = 60
+        cv2.rectangle(display, (x, 5), (x + bw, TOOLBAR_H - 5), color, -1)
+        cv2.rectangle(display, (x, 5), (x + bw, TOOLBAR_H - 5), (200, 200, 200), 1)
+        cv2.putText(display, fmt_label, (x + 8, TOOLBAR_H - 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        buttons.append(("format", x, x + bw))
         x += bw + 12
 
         # Quit button (right-aligned)
@@ -529,9 +542,10 @@ class KinectCapture:
     def start_recording(self):
         """Begin a new recording."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = "mp4" if self.mp4_mode else "mkv"
         self.temp_video_path = str(self.output_dir / f".tmp_video_{ts}.avi")
         self.temp_audio_path = str(self.output_dir / f".tmp_audio_{ts}.wav")
-        self.output_path = str(self.output_dir / f"capture_{ts}.mkv")
+        self.output_path = str(self.output_dir / f"capture_{ts}.{ext}")
 
         # Video writer — FFV1 lossless in AVI container (temp)
         fourcc = cv2.VideoWriter_fourcc(*"FFV1")
@@ -625,11 +639,18 @@ class KinectCapture:
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
         cmd += ["-i", self.temp_video_path]
 
-        if self.audio_chunks and os.path.exists(self.temp_audio_path):
+        has_audio = self.audio_chunks and os.path.exists(self.temp_audio_path)
+        if has_audio:
             cmd += ["-i", self.temp_audio_path]
-            cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+
+        if self.mp4_mode:
+            cmd += ["-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                    "-pix_fmt", "yuv420p"]
         else:
             cmd += ["-c:v", "copy"]
+
+        if has_audio:
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
 
         cmd += [self.output_path]
 
@@ -644,7 +665,7 @@ class KinectCapture:
     def run(self):
         """Main entry point."""
         print("Kinect RGB + Scarlett Audio Capture")
-        print("  R = record | V = video source | A = audio device | Q = quit")
+        print("  R = record | V = video | A = audio | F = format | Q = quit")
         print(f"  Video: {', '.join(s['name'] for s in self.video_sources)}")
         print(f"  Audio: {', '.join(n for _, n in self.input_devices)}")
         print(f"  Active: {self._current_video_name} + {self._current_audio_name}")
@@ -713,6 +734,10 @@ class KinectCapture:
                     self._switch_video_source()
                 elif action == "audio":
                     self._switch_audio_device()
+                elif action == "format":
+                    if not self.recording:
+                        self.mp4_mode = not self.mp4_mode
+                        print(f"Format → {'MP4' if self.mp4_mode else 'MKV'}")
                 elif action == "quit":
                     if self.recording:
                         self.stop_recording()
@@ -742,6 +767,11 @@ class KinectCapture:
 
                 elif key == ord("a") or key == ord("A"):
                     self._switch_audio_device()
+
+                elif key == ord("f") or key == ord("F"):
+                    if not self.recording:
+                        self.mp4_mode = not self.mp4_mode
+                        print(f"Format → {'MP4' if self.mp4_mode else 'MKV'}")
 
                 # Auto-stop by duration
                 if (
@@ -776,6 +806,8 @@ def main():
     parser.add_argument("--duration", type=float, help="Auto-stop after N seconds")
     parser.add_argument("--countdown", type=int, default=3,
                         help="Countdown seconds before recording (default: 3, 0 to disable)")
+    parser.add_argument("--mp4", action="store_true",
+                        help="Output H.264 MP4 instead of lossless MKV")
     parser.add_argument("--output", default=".", help="Output directory (default: .)")
     parser.add_argument("--audio-device", default=None,
                         help="sounddevice device name/index (default: auto-detect Scarlett)")
@@ -786,6 +818,7 @@ def main():
         audio_device=args.audio_device,
         duration=args.duration,
         countdown=args.countdown,
+        mp4=args.mp4,
     )
     cap.run()
 
