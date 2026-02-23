@@ -179,6 +179,10 @@ class KinectCapture:
         # Positions computed in _draw_toolbar based on current state
         self._pending_click = None
 
+        # Audio level monitoring (always active, not just when recording)
+        self.audio_level = 0.0  # peak amplitude 0..1
+        self.audio_waveform = np.zeros(640, dtype=np.float32)  # downsampled waveform
+
     @property
     def _current_video_source(self):
         return self.video_sources[self.video_src_idx]
@@ -312,13 +316,36 @@ class KinectCapture:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
         buttons.append(("quit", qx, qx + bw))
 
-        # Recording status in center
+        # Recording status
         if self.recording:
             elapsed = time.monotonic() - self.record_start_time
             status = f"REC {elapsed:.1f}s [{self.frame_count}f]"
             cv2.circle(display, (x + 10, TOOLBAR_H // 2), 6, (0, 0, 255), -1)
             cv2.putText(display, status, (x + 22, TOOLBAR_H - 13),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+            x += 160
+
+        # VU meter — fill remaining space before quit button
+        vu_x1 = x + 4
+        vu_x2 = qx - 8
+        if vu_x2 - vu_x1 > 30:
+            vu_y1, vu_y2 = 10, TOOLBAR_H - 10
+            # Background
+            cv2.rectangle(display, (vu_x1, vu_y1), (vu_x2, vu_y2), (25, 25, 25), -1)
+            cv2.rectangle(display, (vu_x1, vu_y1), (vu_x2, vu_y2), (80, 80, 80), 1)
+            # Level fill
+            level = min(self.audio_level, 1.0)
+            fill_w = int((vu_x2 - vu_x1 - 2) * level)
+            if fill_w > 0:
+                # Green → yellow → red gradient
+                if level < 0.6:
+                    vu_color = (0, 200, 0)
+                elif level < 0.85:
+                    vu_color = (0, 200, 200)
+                else:
+                    vu_color = (0, 0, 220)
+                cv2.rectangle(display, (vu_x1 + 1, vu_y1 + 1),
+                              (vu_x1 + 1 + fill_w, vu_y2 - 1), vu_color, -1)
 
         return buttons
 
@@ -332,6 +359,35 @@ class KinectCapture:
             if x1 <= cx <= x2:
                 return name
         return None
+
+    def _draw_waveform(self, display):
+        """Draw audio waveform overlay on the bottom of the display."""
+        wave_h = 60
+        y_base = display.shape[0] - 5  # 5px from bottom
+        y_top = y_base - wave_h
+        y_mid = y_top + wave_h // 2
+
+        # Semi-transparent background
+        overlay = display[y_top:y_base, :].copy()
+        cv2.rectangle(display, (0, y_top), (640, y_base), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.3, display[y_top:y_base, :], 0.7, 0,
+                        display[y_top:y_base, :])
+
+        # Center line
+        cv2.line(display, (0, y_mid), (640, y_mid), (60, 60, 60), 1)
+
+        # Draw waveform as connected line segments
+        waveform = self.audio_waveform
+        half_h = wave_h // 2 - 2
+        points = []
+        for i in range(640):
+            y = int(y_mid - waveform[i] * half_h)
+            y = max(y_top + 1, min(y_base - 1, y))
+            points.append((i, y))
+
+        if len(points) > 1:
+            pts = np.array(points, dtype=np.int32)
+            cv2.polylines(display, [pts], False, (0, 220, 0), 1, cv2.LINE_AA)
 
     def _depth_to_bgr(self, depth):
         """Convert 11-bit depth array to colorized BGR frame."""
@@ -396,6 +452,18 @@ class KinectCapture:
         """sounddevice input callback — pushes audio chunks to queue."""
         if status:
             print(f"Audio: {status}", file=sys.stderr)
+        # Update level and waveform for visualization (always active)
+        mono = indata[:, 0] if indata.ndim > 1 else indata.ravel()
+        self.audio_level = float(np.max(np.abs(mono)))
+        # Downsample to 640 points for waveform display
+        n = len(mono)
+        if n >= 640:
+            step = n // 640
+            self.audio_waveform = mono[:step * 640:step].copy()
+        else:
+            # Stretch short buffer to fill 640
+            indices = np.linspace(0, n - 1, 640).astype(int)
+            self.audio_waveform = mono[indices].copy()
         if self.recording:
             try:
                 self.audio_queue.put_nowait(indata.copy())
@@ -584,6 +652,9 @@ class KinectCapture:
                     toolbar = np.zeros((TOOLBAR_H, 640, 3), dtype=np.uint8)
                     display = np.vstack([toolbar, frame])
                     buttons = self._draw_toolbar(display)
+
+                    # Waveform overlay on bottom of video
+                    self._draw_waveform(display)
 
                     cv2.imshow("Kinect Preview", display)
 
