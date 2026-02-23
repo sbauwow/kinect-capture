@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Kinect RGB + Scarlett Audio capture tool.
 
-Live preview from Xbox 360 Kinect with audio recording from Focusrite Scarlett 4i4.
-Press R to toggle recording, D to toggle RGB/Depth, Q to quit.
+Live preview from Xbox 360 Kinect or webcam with audio recording.
+Press R to record, V to cycle video source, A to cycle audio device, Q to quit.
 """
 
 import argparse
@@ -18,9 +18,10 @@ from pathlib import Path
 from queue import Empty, Queue
 
 import cv2
-import freenect
 import numpy as np
 import sounddevice as sd
+
+freenect = None  # lazy import — only when Kinect is connected
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 TARGET_FPS = 30
@@ -30,7 +31,7 @@ AUDIO_BLOCKSIZE = 1024
 TOOLBAR_H = 40
 
 
-def find_input_devices():
+def find_audio_input_devices():
     """Return list of (device_index, short_name) for real hardware input devices."""
     devices = []
     seen = set()
@@ -49,14 +50,81 @@ def find_input_devices():
     return devices
 
 
+def _kinect_available():
+    """Check if a Kinect is connected by looking for its USB VID:PID."""
+    try:
+        result = subprocess.run(
+            ["lsusb"], capture_output=True, text=True, timeout=3,
+        )
+        # Kinect camera is 045e:02ae
+        return "045e:02ae" in result.stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def find_video_sources():
+    """Return list of video sources: Kinect modes (if connected) + V4L2 webcams.
+
+    Each entry is a dict with keys: type, name, and device (for v4l2).
+    Types: 'kinect_rgb', 'kinect_depth', 'v4l2'
+    """
+    sources = []
+    if _kinect_available():
+        sources.append({"type": "kinect_rgb", "name": "Kinect RGB"})
+        sources.append({"type": "kinect_depth", "name": "Kinect Depth"})
+    # Scan for V4L2 webcams
+    try:
+        result = subprocess.run(
+            ["v4l2-ctl", "--list-devices"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0:
+            lines = result.stdout.strip().split("\n")
+            current_name = None
+            for line in lines:
+                if not line.startswith("\t"):
+                    # Device name line: "icspring camera: icspring camer (usb-...)"
+                    current_name = line.split("(")[0].split(":")[0].strip()
+                else:
+                    dev = line.strip()
+                    # Only take the first /dev/videoN per device (skip metadata nodes)
+                    if dev.startswith("/dev/video") and current_name:
+                        sources.append({
+                            "type": "v4l2",
+                            "name": current_name,
+                            "device": dev,
+                        })
+                        current_name = None  # only first node
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return sources
+
+
 class KinectCapture:
     def __init__(self, output_dir=".", audio_device=None, duration=None):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.duration = duration
 
+        # Video sources
+        self.video_sources = find_video_sources()
+        if not self.video_sources:
+            print("ERROR: No video sources found")
+            sys.exit(1)
+        self.video_src_idx = 0
+        self.webcam_cap = None  # cv2.VideoCapture for V4L2 sources
+        # Import freenect only if Kinect is connected
+        self.has_kinect = any(s["type"].startswith("kinect") for s in self.video_sources)
+        if self.has_kinect:
+            global freenect
+            import freenect as _freenect
+            freenect = _freenect
+        # If starting on a V4L2 source, open it now
+        if self._current_video_source["type"] == "v4l2":
+            self.webcam_cap = cv2.VideoCapture(self._current_video_source["device"])
+
         # Audio devices
-        self.input_devices = find_input_devices()
+        self.input_devices = find_audio_input_devices()
         if not self.input_devices:
             print("WARNING: No hardware input devices found, using default")
             self.input_devices = [(None, "Default")]
@@ -90,7 +158,6 @@ class KinectCapture:
         self.running = True
         self.recording = False
         self.record_start_time = None
-        self.depth_mode = False  # False=RGB, True=Depth
 
         # Queues
         self.video_queue = Queue(maxsize=90)  # ~3s buffer at 30fps
@@ -111,6 +178,32 @@ class KinectCapture:
         # Toolbar buttons: (label, x1, x2) — y is always 0..TOOLBAR_H
         # Positions computed in _draw_toolbar based on current state
         self._pending_click = None
+
+    @property
+    def _current_video_source(self):
+        return self.video_sources[self.video_src_idx]
+
+    @property
+    def _current_video_name(self):
+        return self._current_video_source["name"]
+
+    def _switch_video_source(self):
+        """Cycle to next video source."""
+        # Close current webcam if open
+        if self.webcam_cap is not None:
+            self.webcam_cap.release()
+            self.webcam_cap = None
+        self.video_src_idx = (self.video_src_idx + 1) % len(self.video_sources)
+        src = self._current_video_source
+        print(f"Video → {src['name']}")
+        # Open webcam if switching to V4L2
+        if src["type"] == "v4l2":
+            self.webcam_cap = cv2.VideoCapture(src["device"])
+            if not self.webcam_cap.isOpened():
+                print(f"  Failed to open {src['device']}, skipping")
+                self.webcam_cap = None
+                # Skip to next source
+                self._switch_video_source()
 
     @property
     def _current_audio_device(self):
@@ -178,15 +271,23 @@ class KinectCapture:
         buttons.append(("record", x, x + bw))
         x += bw + 12
 
-        # Mode button (RGB / Depth)
-        mode_label = "DEPTH" if self.depth_mode else "RGB"
-        color = (160, 80, 0) if self.depth_mode else (0, 130, 0)
-        bw = 90
+        # Video source button
+        vid_label = self._current_video_name
+        if len(vid_label) > 14:
+            vid_label = vid_label[:13] + ".."
+        src_type = self._current_video_source["type"]
+        if src_type == "kinect_depth":
+            color = (160, 80, 0)
+        elif src_type == "v4l2":
+            color = (130, 0, 130)
+        else:
+            color = (0, 130, 0)
+        bw = max(len(vid_label) * 10 + 16, 90)
         cv2.rectangle(display, (x, 5), (x + bw, TOOLBAR_H - 5), color, -1)
         cv2.rectangle(display, (x, 5), (x + bw, TOOLBAR_H - 5), (200, 200, 200), 1)
-        cv2.putText(display, mode_label, (x + 12, TOOLBAR_H - 13),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
-        buttons.append(("mode", x, x + bw))
+        cv2.putText(display, vid_label, (x + 8, TOOLBAR_H - 13),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+        buttons.append(("video", x, x + bw))
         x += bw + 12
 
         # Audio device button
@@ -239,17 +340,44 @@ class KinectCapture:
         depth8 = (depth_clipped / 2047.0 * 255).astype(np.uint8)
         return cv2.applyColorMap(depth8, cv2.COLORMAP_JET)
 
+    def _grab_frame(self):
+        """Grab a frame from the current video source. Returns BGR 640x480 or None."""
+        src = self._current_video_source
+        if src["type"] == "kinect_rgb":
+            result = freenect.sync_get_video()
+            # Also fetch depth to keep both streams alive for smooth switching
+            freenect.sync_get_depth()
+            if result is None:
+                return None
+            return cv2.cvtColor(result[0], cv2.COLOR_RGB2BGR)
+        elif src["type"] == "kinect_depth":
+            # Also fetch video to keep both streams alive
+            freenect.sync_get_video()
+            result = freenect.sync_get_depth()
+            if result is None:
+                return None
+            return self._depth_to_bgr(result[0])
+        elif src["type"] == "v4l2":
+            if self.webcam_cap is None or not self.webcam_cap.isOpened():
+                time.sleep(0.03)
+                return None
+            ret, frame = self.webcam_cap.read()
+            if not ret:
+                return None
+            # Resize to 640x480 to match Kinect
+            if frame.shape[:2] != (480, 640):
+                frame = cv2.resize(frame, (640, 480))
+            return frame
+        return None
+
     def video_thread_func(self):
-        """Poll Kinect for both RGB and depth frames simultaneously."""
+        """Poll current video source for frames."""
         while self.running:
             try:
-                rgb_raw, _ = freenect.sync_get_video()
-                depth_raw, _ = freenect.sync_get_depth()
-                if rgb_raw is None or depth_raw is None:
+                bgr = self._grab_frame()
+                if bgr is None:
+                    time.sleep(0.03)
                     continue
-                rgb_bgr = cv2.cvtColor(rgb_raw, cv2.COLOR_RGB2BGR)
-                depth_bgr = self._depth_to_bgr(depth_raw)
-                bgr = depth_bgr if self.depth_mode else rgb_bgr
                 # Update preview frame
                 with self.frame_lock:
                     self.latest_frame = bgr
@@ -261,8 +389,8 @@ class KinectCapture:
                         pass  # drop frame if queue full
             except Exception as e:
                 if self.running:
-                    print(f"Video thread error: {e}")
-                break
+                    print(f"Video: {e}")
+                    time.sleep(0.5)  # back off and retry
 
     def audio_callback(self, indata, frames, time_info, status):
         """sounddevice input callback — pushes audio chunks to queue."""
@@ -418,9 +546,10 @@ class KinectCapture:
     def run(self):
         """Main entry point."""
         print("Kinect RGB + Scarlett Audio Capture")
-        print("  R = toggle recording | D = RGB/Depth | A = audio device | Q = quit")
-        print(f"  Audio devices: {', '.join(n for _, n in self.input_devices)}")
-        print(f"  Active: {self._current_audio_name}")
+        print("  R = record | V = video source | A = audio device | Q = quit")
+        print(f"  Video: {', '.join(s['name'] for s in self.video_sources)}")
+        print(f"  Audio: {', '.join(n for _, n in self.input_devices)}")
+        print(f"  Active: {self._current_video_name} + {self._current_audio_name}")
         if self.duration:
             print(f"  Auto-record for {self.duration}s then exit")
         print()
@@ -465,10 +594,8 @@ class KinectCapture:
                         self.stop_recording()
                     else:
                         self.start_recording()
-                elif action == "mode":
-                    self.depth_mode = not self.depth_mode
-                    label = "Depth" if self.depth_mode else "RGB"
-                    print(f"Switched to {label} mode")
+                elif action == "video":
+                    self._switch_video_source()
                 elif action == "audio":
                     self._switch_audio_device()
                 elif action == "quit":
@@ -492,10 +619,8 @@ class KinectCapture:
                     else:
                         self.start_recording()
 
-                elif key == ord("d") or key == ord("D"):
-                    self.depth_mode = not self.depth_mode
-                    label = "Depth" if self.depth_mode else "RGB"
-                    print(f"Switched to {label} mode")
+                elif key == ord("v") or key == ord("V"):
+                    self._switch_video_source()
 
                 elif key == ord("a") or key == ord("A"):
                     self._switch_audio_device()
@@ -520,7 +645,10 @@ class KinectCapture:
                 if self.audio_stream is not None:
                     self.audio_stream.stop()
                     self.audio_stream.close()
-            freenect.sync_stop()
+            if self.webcam_cap is not None:
+                self.webcam_cap.release()
+            if self.has_kinect:
+                freenect.sync_stop()
             cv2.destroyAllWindows()
             print("Done.")
 
